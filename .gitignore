@@ -1,0 +1,17 @@
+venv/
+.venv/
+
+__pycache__/
+*.pyc
+
+
+*.pt
+
+
+storage/thumbnails/*
+!storage/thumbnails/.gitkeep
+
+
+.env
+.vscode/
+.idea/
