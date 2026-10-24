@@ -11,20 +11,22 @@ import torch
 # =========================
 # KONFIGURASI
 # =========================
-MODEL_PATH = "yolo11s-pose.pt"      # File model YOLOv8 pose di root folder
-VIDEO_SOURCE = 0                     # 0 untuk webcam, atau URL RTSP CCTV
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Gunakan 0 untuk webcam, atau path file video tes
+VIDEO_SOURCE = os.path.join(BASE_DIR, "test_fall.mp4") 
 CONF_THRESHOLD = 0.25                # Minimum confidence deteksi orang
 
-# Threshold hasil kalibrasi dari eksperimen
-ASPECT_RATIO_THRESHOLD = 0.55        # width/height bbox > ini -> indikasi rebah
+# Threshold Rule-based
+ASPECT_RATIO_THRESHOLD = 0.55        # width/height bbox > 0.55 -> indikasi rebah
 TORSO_ANGLE_THRESHOLD = 25           # derajat dari vertikal -> indikasi rebah
-VERTICAL_VELOCITY_THRESHOLD = 25     # px/frame turun cepat -> indikasi jatuh
-INACTIVITY_SECONDS = 1               # Durasi diam (detik) untuk konfirmasi jatuh
+VERTICAL_VELOCITY_THRESHOLD = 20     # px/frame turun cepat -> indikasi jatuh
 
+INACTIVITY_SECONDS = 1.0             # Durasi diam (detik) untuk konfirmasi jatuh
 POSTURE_WINDOW = 5                   # Jumlah frame window untuk voting mayoritas
-POSTURE_VOTE_RATIO = 0.5             # Minimal proporsi TRUE dalam window
+POSTURE_VOTE_RATIO = 0.4             # Minimal 40% TRUE dalam window agar lebih sensitif
 
-ALERT_API_URL = "http://127.0.0.1:8000/api/incident-alerts"  # Endpoint FastAPI
+ALERT_API_URL = "http://127.0.0.1:8000/api/incident-alerts"
 
 # Index keypoint COCO Pose
 NOSE, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP = 0, 5, 6, 11, 12
@@ -36,8 +38,7 @@ def calc_torso_angle(shoulder_mid, hip_mid):
     """Menghitung sudut kemiringan torso terhadap sumbu vertikal."""
     dx = hip_mid[0] - shoulder_mid[0]
     dy = hip_mid[1] - shoulder_mid[1]
-    angle_from_vertical = math.degrees(math.atan2(abs(dx), abs(dy) + 1e-6))
-    return angle_from_vertical
+    return math.degrees(math.atan2(abs(dx), abs(dy) + 1e-6))
 
 
 def calc_aspect_ratio(box):
@@ -76,12 +77,12 @@ class PersonTracker:
 
     def vertical_velocity(self):
         if len(self.hip_y_history) < 2:
-            return 0
+            return 0.0
         return self.hip_y_history[-1] - self.hip_y_history[0]
 
-    def is_inactive(self, current_hip, movement_threshold=15):
-        if self.last_hip_pos is None:
-            return False
+    def is_inactive(self, current_hip, movement_threshold=40):
+        if self.last_hip_pos is None or current_hip is None:
+            return True  # Anggap diam jika keypoint hilang saat tergeletak
         dist = math.dist(current_hip, self.last_hip_pos)
         return dist < movement_threshold
 
@@ -91,17 +92,13 @@ def send_alert(frame, track_id, confidence):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     filename = f"temp_alert_{track_id}_{int(time.time())}.jpg"
     
-    # 1. Simpan frame sementara ke disk
     cv2.imwrite(filename, frame)
-    
-    # 2. Payload multipart form-data untuk FastAPI
     payload = {
         "device_id": 1,
         "confidence": round(confidence, 2)
     }
 
     try:
-        # 3. Kirim POST Request ke FastAPI
         with open(filename, "rb") as img_file:
             response = requests.post(
                 ALERT_API_URL,
@@ -119,33 +116,25 @@ def send_alert(frame, track_id, confidence):
         print(f"[WARNING] Gagal koneksi ke FastAPI: {e}")
     
     finally:
-        # 4. Hapus snapshot sementara dari disk lokal
         if os.path.exists(filename):
             os.remove(filename)
 
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    if device == "cpu":
-        torch.set_num_threads(4)
-        MODEL_PATH = "yolo11n-pose.pt"
-    else:
-        MODEL_PATH = "yolo11s-pose.pt"
+    MODEL_PATH = "yolo11n-pose.pt" if device == "cpu" else "yolo11s-pose.pt"
     print(f"[INFO] Device detected: {device} | Using model: {MODEL_PATH}")
     model = YOLO(MODEL_PATH).to(device)
 
     cap = cv2.VideoCapture(VIDEO_SOURCE)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
     trackers = {}
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
-            print("Gagal membaca frame kamera, mencoba lagi...")
-            continue
+            print("[INFO] Video playback completed or unable to read frame.")
+            break
 
-        # Gunakan tracker ByteTrack agar ID orang lebih stabil & tidak gampang berubah
         results = model.track(
             frame,
             imgsz=480, 
@@ -160,8 +149,6 @@ def main():
             boxes = results[0].boxes.xyxy.cpu().numpy()
             track_ids = results[0].boxes.id.int().cpu().tolist()
             keypoints_xy = results[0].keypoints.xy.cpu().numpy()
-            
-            # Ambil data keypoints lengkap termasuk confidence score [x, y, conf]
             keypoints_data = results[0].keypoints.data.cpu().numpy()
 
             for i, (box, track_id, kpts) in enumerate(zip(boxes, track_ids, keypoints_xy)):
@@ -169,21 +156,21 @@ def main():
                     trackers[track_id] = PersonTracker()
                 tracker = trackers[track_id]
 
-                # Ambil confidence score khusus pinggul (L_HIP=11, R_HIP=12)
+                raw_posture_flag = False
                 person_kpts = keypoints_data[i]
+                aspect_ratio = calc_aspect_ratio(box)
+
+                # Fleksibel: Paling tidak satu pinggul > 0.30
                 l_hip_conf = person_kpts[L_HIP][2] if len(person_kpts) > L_HIP else 0
                 r_hip_conf = person_kpts[R_HIP][2] if len(person_kpts) > R_HIP else 0
+                has_valid_hips = (l_hip_conf > 0.30) or (r_hip_conf > 0.30)
 
-                # Validasi: Pinggul wajib terdeteksi jelas (confidence > 0.45)
-                has_valid_hips = (l_hip_conf > 0.45) and (r_hip_conf > 0.45)
-
+                hip_mid = None
                 if has_valid_hips:
                     shoulder_mid = midpoint(kpts[L_SHOULDER], kpts[R_SHOULDER])
                     hip_mid = midpoint(kpts[L_HIP], kpts[R_HIP])
 
-                    aspect_ratio = calc_aspect_ratio(box)
                     torso_angle = calc_torso_angle(shoulder_mid, hip_mid)
-
                     tracker.update_hip(hip_mid)
                     v_velocity = tracker.vertical_velocity()
 
@@ -193,8 +180,9 @@ def main():
                         or v_velocity > VERTICAL_VELOCITY_THRESHOLD
                     )
                 else:
-                    # Jika pinggul terpotong/tidak terlihat (seperti saat duduk rapat ke webcam), paksa False
-                    raw_posture_flag = False
+                    # Fallback jika keypoint tertutup saat tergeletak di lantai
+                    if aspect_ratio > 0.75:
+                        raw_posture_flag = True
 
                 posture_indicates_fall = tracker.update_posture_flag(raw_posture_flag)
 
@@ -205,18 +193,18 @@ def main():
                         tracker.fall_suspected_since = time.time()
 
                     duration = time.time() - tracker.fall_suspected_since
-                    inactive = tracker.is_inactive(hip_mid) if has_valid_hips else False
+                    inactive = tracker.is_inactive(hip_mid)
 
-                    # Pemicu utama insiden jatuh terkonfirmasi
                     if duration >= INACTIVITY_SECONDS and inactive and not tracker.alert_sent:
                         status_text = "FALL DETECTED"
                         send_alert(frame, track_id, confidence=0.9)
                         tracker.alert_sent = True
+                    elif tracker.alert_sent:
+                        status_text = "FALL DETECTED"
                 else:
                     tracker.fall_suspected_since = None
                     tracker.alert_sent = False
 
-                # Tampilkan text indikator status di layar
                 x1, y1 = int(box[0]), int(box[1])
                 color = (0, 0, 255) if "FALL" in status_text else (0, 255, 0)
                 cv2.putText(
