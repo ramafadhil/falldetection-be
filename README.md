@@ -29,10 +29,8 @@ python -m venv venv
 pip install -r requirements.txt
 ```
 
-### 3. Setup Database
-Pastikan PostgreSQL aktif, lalu sesuaikan URL koneksi di `database.py`:
-```python
-SQLALCHEMY_DATABASE_URL = "postgresql://<USER>:<PASSWORD>@localhost:5432/<DATABASE_NAME>"
+### 3. Environment & Database Setup
+1. Buat file `.env` dengan menyalin file `.env.example`:
 ```
 
 ---
